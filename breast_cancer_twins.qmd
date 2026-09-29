@@ -1,0 +1,684 @@
+---
+title: "Breast Cancer Risk in Twin Cohorts"
+subtitle: "Cox Proportional Hazards Models with Menopausal Time-Splitting"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+editor: visual
+---
+
+## Setup
+
+```{r setup}
+#| label: setup
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+
+library(dplyr)
+library(tidyr)
+library(survival)
+library(tidyverse)
+library(broom)
+library(flextable)
+library(officer)
+library(ggplot2)
+library(gtsummary)
+library(table1)
+library(survminer)
+```
+
+## Overview
+
+This document builds the analytic cohort from the raw twin registry data, constructs two versions of the exposure variable for dizygotic (DZ) twins — one keeping the co-twin's sex separate, one combining male and female co-twins — and fits Cox proportional hazards models for breast cancer (BC) risk. Menopausal status is treated as a time-varying covariate via time-splitting.
+
+All downstream tables and forest plots are restricted to the **DZ cohorts vs. the non-twin reference group**, since these were the only comparisons requiring further analysis.
+
+## 1. Data Loading and Cohort Construction
+
+```{r load-data}
+#| label: load-data
+
+load("dr00368_01_01.Rdata")
+unfiltered_data <- as_tibble(sas)
+```
+
+### 1.1 Apply inclusion/exclusion criteria
+
+Exclusions: prevalent BC at baseline, triplets+, no full BC-affected sibling, unknown BC event status.
+
+```{r build-cohort}
+#| label: build-cohort
+
+sas_tibble <- unfiltered_data %>%
+  filter(is.na(FU_BCInvD_DxPrebaseline) | FU_BCInvD_DxPrebaseline == 0) %>%
+  filter(F28fix <= 2 | is.na(F28fix)) %>%                      # remove triplets
+  filter(!(SX_FullSisBC == 0 &
+             (SX_FullSisBC_SameAge == 0 | is.na(SX_FullSisBC_SameAge)))) %>%
+  filter(!is.na(FU_BCInvD_Event)) %>% #incomplete BC information
+  mutate(monozygotic = case_when(
+    F32fix == 1 | F38fix == 1 ~ 1,   # genetic test confirmed identical
+    F32fix == 2 | F38fix == 2 ~ 0,   # genetic test confirmed non-identical
+    F30fix == 1 | F36fix == 1 ~ 1,   # no test, but believes identical
+    F30fix == 0 | F36fix == 0 ~ 0,   # no test, but believes nonidentical
+    is.na(F32fix) & is.na(F38fix) & is.na(F30fix) & is.na(F36fix) &
+      F28fix == 2 ~ 0,
+    .default = NA_real_
+  )) %>%
+  select(PSID, Maternal_age1 = F2Age_v1, Maternal_age2 = F2Age_v2,
+         Paternal_age1 = F16Age_v1, Paternal_age2 = F16Age_v2,
+         Birth_weight = F20Weight, Baseline_Year, Birth_Year,
+         EX_Visit_AgeExact, Bayesian_fam_history = BFHS,
+         Lifetime_Risk = BOADICEA_BC_LT_V2, FU_BCInvD_DxAgeExact,
+         FU_BCInvD_EOFAgeExact, FU_BCInvD_Event, FU_BC_PrimaryCOD,
+         FU_BC_NDIDC_Conf, everything())
+```
+
+### 1.2 Define the eight zygosity/exposure cohorts
+
+```{r cohorts}
+#| label: cohorts
+
+cohort1 <- sas_tibble %>%
+  filter(monozygotic == 1, SX_FullSisBC_SameAge >= 1)               # MZ, co-twin BC
+
+cohort2 <- sas_tibble %>%
+  filter(monozygotic == 0, F29fix != 1 | is.na(F29fix),
+         SX_FullSisBC_SameAge == 0, SX_FullSisBC >= 1)              # DZ, co-twin unaffected, another sister affected
+
+cohort3 <- sas_tibble %>%
+  filter(monozygotic == 0 | is.na(monozygotic),
+         SX_FullSisBC_SameAge >= 1)  # DZ, co-twin BC                                   # DZ, co-twin BC
+
+cohort4 <- sas_tibble %>%
+  filter(F27fix == 1 | is.na(F27fix), SX_FullSisBC >= 1)# non-twin, affected full sister
+
+cohort5 <- sas_tibble %>%
+  filter(monozygotic == 1 & SX_FullSisBC_SameAge == 0 & SX_FullSisBC >= 1)  # MZ, co-twin unaffected, another sister affected
+
+cohort6 <- sas_tibble %>%
+  filter(F29fix == 1, SX_FullSisBC_SameAge == 0)                # DZ, male co-twin
+
+cohort7 <- sas_tibble %>%
+  filter((F32fix == 1 | F38fix == 1) &
+           !is.na(SX_FullSisBC_SameAge) & SX_FullSisBC_SameAge >= 1)  # confirmed MZ, co-twin BC
+
+cohort8 <- sas_tibble %>%
+  filter((F32fix == 1 | F38fix == 1) &
+           !is.na(SX_FullSisBC_SameAge) & SX_FullSisBC_SameAge == 0 &
+           !is.na(SX_FullSisBC) & SX_FullSisBC >= 1)  # confirmed MZ, co-twin unaffected
+
+cat(
+  "Cohort 1 - MZ, co-twin BC:                        ", nrow(cohort1), "\n",
+  "Cohort 2 - DZ, co-twin unaffected, sister BC:      ", nrow(cohort2), "\n",
+  "Cohort 3 - DZ, co-twin BC:                         ", nrow(cohort3), "\n",
+  "Cohort 4 - Non-twin, affected full sister:          ", nrow(cohort4), "\n",
+  "Cohort 5 - MZ, co-twin unaffected, sister BC:       ", nrow(cohort5), "\n",
+  "Cohort 6 - DZ, male co-twin:                        ", nrow(cohort6), "\n",
+  "Cohort 7 - Confirmed MZ, co-twin BC:                ", nrow(cohort7), "\n",
+  "Cohort 8 - Confirmed MZ, co-twin unaffected:        ", nrow(cohort8), "\n",
+  "Total (cohorts 1-6):                                ", nrow(cohort1) + nrow(cohort2) + nrow(cohort3) + nrow(cohort4) + nrow(cohort5) + nrow(cohort6), "\n",
+  sep = ""
+)
+
+```
+
+```{r cohort-column}
+#| label: cohort-column
+
+sas_tibble <- sas_tibble %>%
+  mutate(cohort = case_when(
+    PSID %in% cohort7$PSID                            ~ 7,
+    PSID %in% cohort8$PSID                            ~ 8,
+    PSID %in% cohort1$PSID & !PSID %in% cohort7$PSID  ~ 1,
+    PSID %in% cohort2$PSID                            ~ 2,
+    PSID %in% cohort3$PSID                            ~ 3,
+    PSID %in% cohort4$PSID                            ~ 4,
+    PSID %in% cohort5$PSID & !PSID %in% cohort8$PSID  ~ 5,
+    PSID %in% cohort6$PSID                            ~ 6,
+    TRUE                                               ~ NA_real_
+  ))
+```
+
+### 1.3 Cohort summary table
+
+```{r cohort-summary}
+#| label: cohort-summary
+
+cohort_summary <- tibble(
+  Cohort = 1:8,
+  Description = c(
+    "MZ twins, co-twin had BC",
+    "DZ twins, co-twin did NOT have BC but another full sister did",
+    "DZ twins, co-twin DID have BC",
+    "Non-twins, affected full sister (reference)",
+    "MZ twins, co-twin did NOT have BC but another affected sister did",
+    "DZ twins, co-twin is male",
+    "Confirmed MZ twins, co-twin had BC",
+    "Confirmed MZ twins, co-twin did NOT have BC"
+  ),
+  N = c(nrow(cohort1), nrow(cohort2), nrow(cohort3), nrow(cohort4),
+        nrow(cohort5), nrow(cohort6), nrow(cohort7), nrow(cohort8)),
+  BC_Cases = c(
+    sum(cohort1$FU_BCInvD_Event == 1, na.rm = TRUE),
+    sum(cohort2$FU_BCInvD_Event == 1, na.rm = TRUE),
+    sum(cohort3$FU_BCInvD_Event == 1, na.rm = TRUE),
+    sum(cohort4$FU_BCInvD_Event == 1, na.rm = TRUE),
+    sum(cohort5$FU_BCInvD_Event == 1, na.rm = TRUE),
+    sum(cohort6$FU_BCInvD_Event == 1, na.rm = TRUE),
+    sum(cohort7$FU_BCInvD_Event == 1, na.rm = TRUE),
+    sum(cohort8$FU_BCInvD_Event == 1, na.rm = TRUE)
+  )
+)
+```
+
+## 2. Exposure Variable Construction
+
+### 2.1 Separate DZ male/female co-twin (`dat_all_sep`)
+
+```{r exposure-sep}
+#| label: exposure-sep
+
+dat_all_sep <- sas_tibble %>%
+  mutate(
+    exposure = case_when(
+      PSID %in% cohort7$PSID                            ~ "MZ_confirmed_BC",
+      PSID %in% cohort3$PSID                            ~ "DZ_BC",
+      PSID %in% cohort1$PSID & !PSID %in% cohort7$PSID  ~ "Unk_zyg_BC",
+      PSID %in% cohort8$PSID                            ~ "MZ_confirmed_noBC",
+      PSID %in% cohort2$PSID                            ~ "DZ_noBC",
+      PSID %in% cohort5$PSID & !PSID %in% cohort8$PSID  ~ "Unk_zyg_noBC",
+      PSID %in% cohort4$PSID                            ~ "NonTwin_SisBC",
+      PSID %in% cohort6$PSID                            ~ "DZ_noBC_Male_co-twin",
+      TRUE ~ NA_character_
+    ),
+    exposure_f = relevel(factor(exposure), ref = "NonTwin_SisBC")
+  ) %>%
+  filter(!is.na(exposure))
+  #filter(!is.na(EX_BMI_final))
+
+dat_all_sep %>%
+  count(exposure) %>%
+  arrange(match(exposure, c(
+    "MZ_confirmed_BC", "DZ_BC", "Unk_zyg_BC", "MZ_confirmed_noBC",
+    "DZ_noBC", "Unk_zyg_noBC", "NonTwin_SisBC", "DZ_noBC_Male_co-twin"
+  )))
+```
+
+```{r missingness}
+#| label: missingness
+
+covariates <- c("EX_BMI_final", "Bayesian_fam_history")
+
+dat_all_sep %>%
+  group_by(exposure) %>%
+  summarise(
+    N = n(),
+    across(all_of(covariates), ~ sum(is.na(.)), .names = "miss_{.col}"),
+    .groups = "drop"
+  )
+```
+
+## 3. Menopause Variable Construction
+
+The following logic is applied to the exposure dataset (`dat_all_sep`) to build menopausal age/status and then time-split each person into pre- and post-menopausal intervals.
+
+```{r meno-function}
+#| label: meno-function
+
+build_dat_meno <- function(dat) {
+  dat %>%
+    mutate(
+      BC_Event = FU_BCInvD_Event,
+
+      # Menopausal age: exact if available, fall back to integer age
+      menoage = FU_BCInvD_MenopauseAgeExact,
+      menoage = case_when(
+        is.na(menoage) & !is.na(FU_BCInvD_MenopauseAge) &
+          FU_BCInvD_MenopauseAge != as.integer(AgeExact_T0)
+        ~ as.numeric(FU_BCInvD_MenopauseAge),
+        is.na(menoage) & !is.na(FU_BCInvD_MenopauseAge) &
+          FU_BCInvD_MenopauseAge == as.integer(AgeExact_T0) &
+          FU_BCInvD_MenopauseStatus %in% c(6, 7, 11)
+        ~ AgeExact_T0 + 0.9,
+        is.na(menoage) & !is.na(FU_BCInvD_MenopauseAge) &
+          FU_BCInvD_MenopauseAge == as.integer(AgeExact_T0) &
+          (FU_BCInvD_MenopauseStatus %in% c(1, 3, 4, 5, 8, 9, 10) |
+             is.na(FU_BCInvD_MenopauseStatus))
+        ~ as.numeric(FU_BCInvD_MenopauseAge),
+        TRUE ~ menoage
+      ),
+
+      # Earliest hysterectomy age across waves
+      hyst_age_min = pmin(HR_HystAgeExact_T0, HR_HystAgeExact_T1,
+                          HR_HystAgeExact_T2, HR_HystAgeExact_T3,
+                          HR_HystAgeExact_T4, HR_HystAgeExact_T5, na.rm = TRUE),
+      hyst_age_min = if_else(is.infinite(hyst_age_min), NA_real_, hyst_age_min),
+
+      # EOF age censored at hysterectomy if hyst before EOF
+      eof_age_imp_hyst = if_else(
+        !is.na(hyst_age_min) & hyst_age_min < FU_BCInvD_EOFAgeExact,
+        hyst_age_min, FU_BCInvD_EOFAgeExact
+      ),
+
+      # Baseline menopausal status (1 = post, 0 = pre)
+      baseline_meno = case_when(
+        !is.na(menoage) & menoage <= AgeExact_T0                     ~ 1,
+        !is.na(menoage) & menoage >  AgeExact_T0                     ~ 0,
+        is.na(menoage) & HR_MenopauseStatus_T0 %in% c(6, 7, 11, 9)   ~ 0,
+        is.na(menoage) & HR_MenopauseStatus_T0 %in% c(1, 2, 3, 4, 5, 10) ~ 1,
+        is.na(menoage) & (HR_MenopauseStatus_T0 == 8 | is.na(HR_MenopauseStatus_T0)) &
+          FU_BCInvD_MenopauseStatus %in% c(6, 7, 11)                 ~ 0,
+        TRUE ~ NA_real_
+      ),
+
+      # Impute menoage for those premenopausal at baseline
+      menoage = case_when(
+        is.na(menoage) & baseline_meno == 0 &
+          FU_BCInvD_MenopauseStatus %in% c(1, 2, 3, 5, 8) &
+          AgeExact_T0 < 55 & eof_age_imp_hyst >= 55                  ~ 55,
+        is.na(menoage) & baseline_meno == 0 &
+          FU_BCInvD_MenopauseStatus %in% c(1, 2, 3, 5, 8) &
+          AgeExact_T0 >= 55                                          ~ AgeExact_T0 + 0.1,
+        is.na(menoage) & baseline_meno == 0 &
+          FU_BCInvD_MenopauseStatus %in% c(1, 2, 3, 5) &
+          eof_age_imp_hyst < 55                                      ~ eof_age_imp_hyst - 0.1,
+        is.na(menoage) & baseline_meno == 0 &
+          FU_BCInvD_MenopauseStatus == 8 & eof_age_imp_hyst < 55     ~ NA_real_,
+        TRUE ~ menoage
+      ),
+
+      # EOF menopausal status (1 = post by EOF, 0 = still pre)
+      eof_meno = case_when(
+        baseline_meno == 1                                              ~ 1,
+        baseline_meno == 0 & !is.na(menoage) & menoage >  eof_age_imp_hyst ~ 0,
+        baseline_meno == 0 & !is.na(menoage) & menoage <= eof_age_imp_hyst ~ 1,
+        baseline_meno == 0 & FU_BCInvD_MenopauseStatus %in% c(6, 7, 11) ~ 0,
+        TRUE ~ NA_real_
+      ),
+      eof_meno = replace(eof_meno, FU_BCInvD_MenopauseStatus == 9, 0),
+      eof_meno = if_else(
+        baseline_meno == 0 & FU_BCInvD_MenopauseStatus == 8 & eof_age_imp_hyst < 55,
+        0, eof_meno
+      ),
+
+      # Did she transition during follow-up?
+      postmeno_time = case_when(
+        baseline_meno == 0 & eof_meno == 0 ~ 0,
+        baseline_meno == 0 & eof_meno == 1 ~ 1,
+        baseline_meno == 1                 ~ 1
+      )
+    )
+}
+
+build_meno_split <- function(dat_meno) {
+  pre <- dat_meno %>%
+    filter(baseline_meno == 0) %>%
+    mutate(
+      tstart  = AgeExact_T0,
+      tstop   = if_else(eof_meno == 1, menoage, FU_BCInvD_EOFAgeExact),
+      event3  = if_else(BC_Event == 1 & postmeno_time == 0, 1L, 0L),
+      prepost = 0L
+    )
+
+  post <- dat_meno %>%
+    filter(baseline_meno == 1 | (baseline_meno == 0 & eof_meno == 1)) %>%
+    mutate(
+      tstart  = if_else(baseline_meno == 1, AgeExact_T0, menoage),
+      tstop   = FU_BCInvD_EOFAgeExact,
+      event3  = if_else(BC_Event == 1 & postmeno_time == 1, 1L, 0L),
+      prepost = 1L
+    )
+
+  combined <- bind_rows(pre, post)
+  
+  cat("Rows before final filter:", nrow(combined), "\n")
+  cat("  Removed - tstart is NA:          ", sum(is.na(combined$tstart)), "\n")
+  cat("  Removed - tstop is NA:           ", sum(is.na(combined$tstop)), "\n")
+  cat("  Removed - tstop <= tstart:       ", sum(!is.na(combined$tstart) & 
+                                                  !is.na(combined$tstop) & 
+                                                  combined$tstop <= combined$tstart), "\n")
+  
+  result <- combined %>%
+    filter(!is.na(tstart), !is.na(tstop), tstop > tstart) %>%
+    mutate(prepost = factor(prepost, levels = c(0, 1),
+                            labels = c("Premenopausal", "Postmenopausal")))
+  
+  cat("Rows after final filter:", nrow(result), "\n")
+  cat("Total removed:", nrow(combined) - nrow(result), "\n")
+  
+  result
+}
+```
+
+### 3.1 Apply to the DZ dataset
+
+```{r meno-sep}
+#| label: meno-sep
+
+dat_meno_sep   <- build_dat_meno(dat_all_sep)
+meno_split_sep <- build_meno_split(dat_meno_sep)
+
+dat_meno_sep %>% summarise(
+  n                  = n(),
+  n_baseline_post    = sum(baseline_meno == 1, na.rm = TRUE),
+  n_baseline_pre     = sum(baseline_meno == 0, na.rm = TRUE),
+  n_transitioned     = sum(baseline_meno == 0 & eof_meno == 1, na.rm = TRUE),
+  n_stayed_pre       = sum(baseline_meno == 0 & eof_meno == 0, na.rm = TRUE),
+  n_missing_baseline = sum(is.na(baseline_meno)),
+  n_missing_eof      = sum(is.na(eof_meno))
+)
+
+
+```
+
+## 4. Cox models
+
+### 4.1 Separate DZ male/female co-twin dataset and model
+
+```{r}
+# Separate DZ male/female co-twin version
+meno_split_sep_dz <- meno_split_sep %>%
+  filter(exposure_f %in% c("NonTwin_SisBC", "DZ_BC", "DZ_noBC",
+                            "DZ_noBC_Male_co-twin")) %>%
+  droplevels()
+
+table(meno_split_sep_dz$exposure_f)
+
+meno_split_sep_dz %>%
+  group_by(exposure_f) %>%
+  summarise(
+    n_distinct_PSID = n_distinct(PSID),
+    n_BCInvD_Event = n_distinct(PSID[FU_BCInvD_Event == 1])
+  )
+
+cox_meno_sep_dzonly <- coxph(
+  Surv(tstart, tstop, event3) ~
+    exposure_f + 
+    EX_BMI_final * prepost +
+    Bayesian_fam_history,
+  data = meno_split_sep_dz
+)
+
+```
+
+### 4.2 Testing assumptions of Cox Model
+
+```{r}
+## 1. Proportional Hazards Assumption 
+# Schoenfeld residuals test: tests whether scaled residuals for each
+# covariate are correlated with time. A significant p-value (<0.05)
+# suggests that covariate's effect is NOT constant over time (PH violated).
+
+ph_test <- cox.zph(cox_meno_sep_dzonly)
+print(ph_test)
+
+ggcoxzph(ph_test, var = "Bayesian_fam_history")
+
+## Extract Schoenfeld residuals from the fitted model -----------------------
+ph_test <- cox.zph(cox_meno_sep_dzonly)
+
+# cox.zph() stores the residuals as a matrix with time as an attribute
+schoenfeld_df <- as.data.frame(ph_test$y)
+schoenfeld_df$time <- ph_test$x
+names(schoenfeld_df) <- c(colnames(ph_test$y), "time")
+
+## Reshape to long format for faceted plotting 
+
+schoenfeld_long <- schoenfeld_df %>%
+  pivot_longer(
+    cols = -time,
+    names_to = "covariate",
+    values_to = "residual"
+  ) %>%
+  mutate(
+    # log transform: residuals can be negative, so take log of absolute
+    # value and preserve the sign separately
+    log_abs_residual = log(abs(residual)),
+    sign = if_else(residual >= 0, "positive", "negative")
+  )
+
+## Checking only Bayesian_fam_history specifically 
+schoenfeld_long %>%
+  filter(covariate == "Bayesian_fam_history") %>%
+  ggplot(aes(x = time, y = log_abs_residual)) +
+  geom_point(alpha = 0.4, size = 1.5, color = "#2C7FB8") +
+  geom_smooth(method = "loess", se = TRUE, color = "black", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Log-Transformed Schoenfeld Residuals: Bayesian Family History",
+    x = "Time",
+    y = "log(|Schoenfeld residual|)"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 5. Results and Figures
+
+### 5.1 Table 1 — Baseline characteristics (DZ + singleton only)
+
+```{r}
+# Filter to the relevant exposure groups 
+table1_data <- dat_all_sep %>%
+  filter(exposure %in% c("DZ_BC", "DZ_noBC", "NonTwin_SisBC", "DZ_noBC_Male_co-twin")) %>%
+  droplevels() %>%
+  mutate(
+    exposure_t1 = factor(
+      exposure,
+      levels = c("NonTwin_SisBC", "DZ_noBC", "DZ_noBC_Male_co-twin", "DZ_BC"),
+      labels = c("Non-twin, sister with BC (reference)",
+                 "DZ twin, female co-twin no BC",
+                 "DZ twin, male co-twin no BC",
+                 "DZ twin, co-twin had BC")
+    )
+  )
+
+table(table1_data$exposure_t1)
+
+# Build summary table 
+
+table1 <- table1_data %>%
+  select(exposure_t1, AgeExact_T0, EX_BMI_final, FU_BCInvD_MenopauseAgeExact) %>%
+  tbl_summary(
+    by = exposure_t1,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    missing = "ifany",
+    missing_text = "Missing",
+    label = list(
+      AgeExact_T0                  ~ "Age at baseline, y",
+      EX_BMI_final                 ~ "BMI, kg/m2",
+      FU_BCInvD_MenopauseAgeExact  ~ "Age at menopause, y"
+    )
+  ) %>%
+  add_overall() %>%
+  modify_header(label ~ "**Characteristic**") %>%
+  modify_footnote(everything() ~ NA) %>%
+  as_flex_table()
+
+# Apply formatting 
+table1 <- table1 %>%
+  flextable::bold(part = "all", bold = FALSE) %>%
+  flextable::bg(bg = "white", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::border_remove() %>%
+  flextable::hline_top(part = "header", border = fp_border(width = 1.5)) %>%
+  flextable::hline_bottom(part = "header", border = fp_border(width = 1)) %>%
+  flextable::set_caption(
+    caption = as_paragraph(
+      as_chunk(
+        "Table 1. Baseline Characteristics of Dizygotic Twins and Non-twin Sisters, by Breast Cancer Exposure Group",
+        props = fp_text_default(
+          font.family = "Times New Roman",
+          color = "black",
+          bold = TRUE,
+          font.size = 10
+        )
+      )
+    )
+  ) %>%
+  flextable::width(j = 1, width = 1.5) %>%
+  flextable::width(j = 2:6, width = 1.0)
+
+table1
+
+# Export 
+sect_properties <- prop_section(
+  page_size = page_size(orient = "portrait", width = 8.5, height = 11),
+  page_margins = page_mar(top = 1, bottom = 1, left = 1, right = 1)
+)
+
+save_as_docx(table1, path = "table1.docx", pr_section = sect_properties)
+```
+
+### 5.2 Table 2 — Hazard ratios, DZ groups vs. singleton (separate, DZ-only model)
+
+```{r table2-combined}
+#| label: table2-sep
+
+s_sep <- summary(cox_meno_sep_dzonly)
+
+all_results_sep <- data.frame(
+  Variable = rownames(s_sep$coefficients),
+  HR       = s_sep$coefficients[, "exp(coef)"],
+  lower    = s_sep$conf.int[, "lower .95"],
+  upper    = s_sep$conf.int[, "upper .95"],
+  p.value  = s_sep$coefficients[, "Pr(>|z|)"]
+)
+
+results_sep <- all_results_sep %>%
+  filter(grepl("^exposure_fDZ", Variable)) %>%
+  mutate(
+    `HR (95% CI)` = sprintf("%.2f (%.2f to %.2f)", HR, lower, upper),
+    `P value` = ifelse(p.value < .001, "<.001", sprintf("%.2f", p.value))
+  ) %>%
+  select(Variable, `HR (95% CI)`)
+
+results_sep$Variable[results_sep$Variable == "exposure_fDZ_BC"] <-
+  "DZ, affected co-twin"
+results_sep$Variable[results_sep$Variable == "exposure_fDZ_noBC"] <-
+  "DZ, unaffected co-twin (female)"
+results_sep$Variable[results_sep$Variable == "exposure_fDZ_noBC_Male_co-twin"] <-
+  "DZ, unaffected co-twin (male)"
+
+# Rename Variable column header
+names(results_sep)[names(results_sep) == "Variable"] <- "Characteristic"
+
+ft_table2_sep <- flextable::flextable(results_sep) %>%
+  flextable::bold(part = "all", bold = FALSE) %>%
+  flextable::bg(bg = "white", part = "all") %>%
+  flextable::font(fontname = "Times New Roman", part = "all") %>%
+  flextable::fontsize(size = 12, part = "all") %>%
+  flextable::border_remove() %>%
+  flextable::hline_top(part = "header", border = fp_border(width = 1.5)) %>%
+  flextable::hline_bottom(part = "header", border = fp_border(width = 1)) %>%
+  flextable::set_caption(
+  caption = as_paragraph(
+    as_chunk(
+      "Table 2 (Separate Model, DZ-only subset). Hazard Ratios for Breast Cancer Among Dizygotic Twins, Co-twin Sex Kept Separate (Referent: Singleton Sisters)",
+      props = fp_text_default(
+        font.family = "Times New Roman",
+        color = "black",
+        bold = TRUE,
+        font.size = 10
+      )
+    )
+  )
+) %>%
+  flextable::autofit()
+
+ft_table2_sep
+
+# Export 
+sect_properties <- officer::prop_section(
+  page_size = officer::page_size(orient = "portrait", width = 8.5, height = 8),
+  page_margins = officer::page_mar(top = 1, bottom = 1, left = 1, right = 1)
+)
+
+save_as_docx(ft_table2_sep, path = "table2_sep.docx", pr_section = sect_properties)
+```
+
+### 5.3 Forest plot — DZ groups (combined, DZ-only model)
+
+```{r forest-separate}
+#| label: forest-separate
+
+forest_data_sep <- all_results_sep %>%
+  filter(grepl("^exposure_fDZ", Variable)) %>%
+  mutate(
+    Label = case_when(
+      Variable == "exposure_fDZ_BC"                ~ "DZ, BC",
+      Variable == "exposure_fDZ_noBC"               ~ "DZ, no BC (female co-twin)",
+      Variable == "exposure_fDZ_noBC_Male_co-twin"  ~ "DZ, no BC (male co-twin)",
+      TRUE ~ Variable
+    ),
+    sig      = if_else(p.value < .05, "sig", "ns"),
+    hr_label = sprintf("%.2f (%.2f to %.2f)", HR, lower, upper)
+  ) %>%
+  rename(`Lower 95% CI` = lower, `Upper 95% CI` = upper)
+
+# Add the reference group as an explicit HR = 1 row 
+ref_row <- tibble(
+  Variable       = "exposure_fNonTwin_SisBC",
+  HR             = 1,
+  `Lower 95% CI` = NA_real_,
+  `Upper 95% CI` = NA_real_,
+  p.value        = NA_real_,
+  Label          = "Non-twin, sister with BC (ref)",
+  sig            = "ref",
+  hr_label       = "1.00 (Reference)"
+)
+
+forest_data_sep <- bind_rows(ref_row, forest_data_sep)
+
+forest_data_sep$Label <- factor(
+  forest_data_sep$Label,
+  levels = rev(c("Non-twin, sister with BC (ref)", "DZ, BC",
+                 "DZ, no BC (female co-twin)", "DZ, no BC (male co-twin)"))
+)
+
+forest_plot_sep <- ggplot(forest_data_sep, aes(x = HR, y = Label)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "black", linewidth = 0.4) +
+  geom_errorbarh(aes(xmin = `Lower 95% CI`, xmax = `Upper 95% CI`),
+                 height = 0.2, linewidth = 0.6, color = "black", na.rm = TRUE) +
+  geom_point(aes(shape = sig), size = 3.5, color = "black", fill = "black", stroke = 0.8) +
+  geom_text(aes(x = max(forest_data_sep$`Upper 95% CI`, na.rm = TRUE) * 1.15, label = hr_label),
+            hjust = 0, size = 4, color = "black") +
+  scale_shape_manual(values = c(sig = 16, ns = 1, ref = 18), guide = "none") +
+  scale_x_log10(breaks = c(0.5, 1, 1.5, 2, 3),
+                limits = c(NA, max(forest_data_sep$`Upper 95% CI`, na.rm = TRUE) * 2.6)) +
+  labs(x = "Hazard ratio (log scale)", y = NULL) +      # title removed
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line.x = element_line(color = "black", linewidth = 0.4),
+    axis.ticks.x = element_line(color = "black", linewidth = 0.4),
+    axis.text.y = element_text(size = 12, color = "black"),
+    axis.text.x = element_text(size = 11, color = "black"),
+    axis.title.x = element_text(size = 12, color = "black"),
+    plot.title = element_blank(),               # no title on the figure
+    plot.subtitle = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.margin = margin(20, 60, 20, 20)
+  )
+
+forest_plot_sep
+
+ggsave("forest_plot_separate.png", plot = forest_plot_sep,
+       width = 8, height = 5, dpi = 600, bg = "white")
+
+```
